@@ -1,0 +1,160 @@
+import "dotenv/config";
+import fs from "node:fs/promises";
+import path from "node:path";
+import { gunzipSync } from "node:zlib";
+import neo4j from "neo4j-driver";
+
+const root = process.cwd();
+const dataDir = path.join(root, "data");
+const resultsDir = path.join(root, "results");
+
+const datasetUrl =
+  "https://snap.stanford.edu/data/soc-Slashdot0811.txt.gz";
+
+const datasetFile =
+  path.join(dataDir, "soc-Slashdot0811.txt.gz");
+
+const databases = {
+  cognodb: ["COGNODB_URI", "COGNODB_USER", "COGNODB_PASSWORD"],
+  neo4j: ["NEO4J_URI", "NEO4J_USER", "NEO4J_PASSWORD"],
+  memgraph: ["MEMGRAPH_URI", "MEMGRAPH_USER", "MEMGRAPH_PASSWORD"],
+  falkordb: ["FALKORDB_URI", "FALKORDB_USER", "FALKORDB_PASSWORD"]
+};
+const settings = {
+  database: process.env.BENCHMARK_DB || "cognodb",
+  iterations: Number(process.env.ITERATIONS || 100),
+  concurrency: Number(process.env.CONCURRENCY || 10),
+  batchSize: Number(process.env.BATCH_SIZE || 1000),
+  traversalFanout: Number(process.env.TRAVERSAL_FANOUT || 50)
+};
+
+function percentile(values, percentage) {
+  const sorted = [...values].sort((a, b) => a - b);
+  const index = Math.min(sorted.length - 1, Math.ceil((percentage / 100) * sorted.length) - 1);
+  return sorted[index] ?? 0;
+}
+
+async function downloadDataset() {
+  await fs.mkdir(dataDir, { recursive: true });
+  const response = await fetch(datasetUrl);
+  if (!response.ok) throw new Error(`Dataset download failed: ${response.status}`);
+  await fs.writeFile(datasetFile, Buffer.from(await response.arrayBuffer()));
+  console.log(`Downloaded ${datasetUrl}`);
+}
+
+async function readDataset() {
+  const compressed = await fs.readFile(datasetFile);
+  const lines = gunzipSync(compressed).toString("utf8").split(/\r?\n/);
+  const edges = [];
+  const nodes = new Set();
+  for (const line of lines) {
+    if (!line || line.startsWith("#")) continue;
+    const [source, target] = line.trim().split(/\s+/).map(Number);
+    if (!Number.isInteger(source) || !Number.isInteger(target)) continue;
+    nodes.add(source); nodes.add(target); edges.push({ source, target });
+  }
+  return { nodes: [...nodes].map(id => ({ id })), edges };
+}
+
+function connectionFor(name) {
+  const keys = databases[name];
+  if (!keys) throw new Error(`Unknown BENCHMARK_DB '${name}'`);
+  const [uriKey, userKey, passwordKey] = keys;
+  const values = [process.env[uriKey], process.env[userKey], process.env[passwordKey]];
+  if (values.some(value => !value || value.includes("replace-me") || value.includes("your-"))) {
+    throw new Error(`Set ${keys.join(", ")} in .env before running this command.`);
+  }
+  return neo4j.driver(values[0], neo4j.auth.basic(values[1], values[2]));
+}
+
+async function executeInBatches(session, query, rows, batchSize) {
+  for (let index = 0; index < rows.length; index += batchSize) {
+    await session.run(query, { rows: rows.slice(index, index + batchSize) });
+    const completed = Math.min(index + batchSize, rows.length);
+    if (completed === rows.length || completed % (batchSize * 25) === 0) {
+      console.log(`Loaded ${completed}/${rows.length} rows`);
+    }
+  }
+}
+
+async function load() {
+  const graph = await readDataset();
+  console.log(`Dataset ready: ${graph.nodes.length} nodes, ${graph.edges.length} relationships`);
+  console.log(`Connecting to ${settings.database}...`);
+  const driver = connectionFor(settings.database);
+  const started = performance.now();
+  const session = driver.session();
+  try {
+    await driver.verifyConnectivity();
+    console.log("Connection verified. Loading nodes...");
+    try { await session.run("CREATE INDEX person_id IF NOT EXISTS FOR (n:Person) ON (n.id)"); } catch (error) {
+      console.warn(`Index creation was not accepted by ${settings.database}: ${error.message}`);
+    }
+    await executeInBatches(session, "UNWIND $rows AS row MERGE (n:Person {id: row.id})", graph.nodes, settings.batchSize);
+    console.log("Loading relationships...");
+    await executeInBatches(session, "UNWIND $rows AS row MATCH (a:Person {id: row.source}), (b:Person {id: row.target}) MERGE (a)-[:FOLLOWS]->(b)", graph.edges, settings.batchSize);
+    const elapsedSeconds = (performance.now() - started) / 1000;
+    console.log(JSON.stringify({ database: settings.database, nodes: graph.nodes.length, relationships: graph.edges.length, loadSeconds: elapsedSeconds, nodesPerSecond: graph.nodes.length / elapsedSeconds, relationshipsPerSecond: graph.edges.length / elapsedSeconds }, null, 2));
+  } finally { await session.close(); await driver.close(); }
+}
+
+async function timedQuery(session, query, parameters) {
+  const started = performance.now();
+  await session.run(query, parameters);
+  return performance.now() - started;
+}
+
+async function readWorkloads() {
+  const graph = await readDataset();
+  const starts = graph.nodes.sort(() => Math.random() - 0.5).slice(0, Math.min(100, graph.nodes.length));
+  const driver = connectionFor(settings.database);
+  const session = driver.session();
+  const workloads = {
+    oneHop: "MATCH (start:Person {id: $id})-[:FOLLOWS]->(n) RETURN count(n)",
+    twoHop: "MATCH (start:Person {id: $id}) CALL { WITH start MATCH (start)-[:FOLLOWS]->(one) RETURN one LIMIT $fanout } CALL { WITH one MATCH (one)-[:FOLLOWS]->(two) RETURN two LIMIT $fanout } RETURN count(two)",
+    threeHop: "MATCH (start:Person {id: $id}) CALL { WITH start MATCH (start)-[:FOLLOWS]->(one) RETURN one LIMIT $fanout } CALL { WITH one MATCH (one)-[:FOLLOWS]->(two) RETURN two LIMIT $fanout } CALL { WITH two MATCH (two)-[:FOLLOWS]->(three) RETURN three LIMIT $fanout } RETURN count(three)",
+    pointLookup: "MATCH (n:Person {id: $id}) RETURN n.id",
+    filteredLookup: "MATCH (n:Person) WHERE n.id = $id RETURN n.id",
+    aggregation: "MATCH (n:Person) RETURN count(n)"
+  };
+  const results = {};
+  try {
+    for (const [name, query] of Object.entries(workloads)) {
+      const latencies = [];
+      for (let warmup = 0; warmup < 5; warmup++) await timedQuery(session, query, { id: starts[warmup % starts.length].id, fanout: settings.traversalFanout });
+      for (let iteration = 0; iteration < settings.iterations; iteration++) {
+        latencies.push(await timedQuery(session, query, { id: starts[iteration % starts.length].id, fanout: settings.traversalFanout }));
+      }
+      results[name] = { iterations: latencies.length, p50Ms: percentile(latencies, 50), p95Ms: percentile(latencies, 95) };
+    }
+    const mixedStarted = performance.now();
+    let completed = 0;
+    await Promise.all(Array.from({ length: settings.concurrency }, async (_, client) => {
+      const clientSession = driver.session();
+      try {
+        for (let iteration = 0; iteration < settings.iterations; iteration++) {
+          const id = starts[(client + iteration) % starts.length].id;
+          if (iteration % 5 === 0) await clientSession.run("MATCH (a:Person {id: $id}), (b:Person {id: $id}) MERGE (a)-[:BENCHMARK_TOUCHES]->(b)", { id });
+          else await clientSession.run(workloads.oneHop, { id });
+          completed++;
+        }
+      } finally { await clientSession.close(); }
+    }));
+    results.mixedWorkload = { concurrency: settings.concurrency, completedQueries: completed, queriesPerSecond: completed / ((performance.now() - mixedStarted) / 1000), readWriteMix: "80% reads / 20% writes" };
+  } finally { await session.close(); await driver.close(); }
+  await fs.mkdir(resultsDir, { recursive: true });
+  const output = { database: settings.database, dataset: "SNAP soc-Slashdot0811", settings, measuredAt: new Date().toISOString(), workloads: results };
+  await fs.writeFile(path.join(resultsDir, `${settings.database}.json`), JSON.stringify(output, null, 2));
+  console.log(JSON.stringify(output, null, 2));
+}
+
+async function main() {
+  const command = process.argv[2] || "all";
+  if (command === "download") return downloadDataset();
+  if (command === "load") return load();
+  if (command === "benchmark") return readWorkloads();
+  if (command === "all") { await downloadDataset().catch(error => console.warn(error.message)); await load(); return readWorkloads(); }
+  throw new Error("Use: download, load, benchmark, or all");
+}
+
+main().catch(error => { console.error(error.message); process.exitCode = 1; });

@@ -1,0 +1,16 @@
+{
+  "name": "cognodb-cloud-benchmark",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "download": "node src/index.js download",
+    "load": "node src/index.js load",
+    "benchmark": "node src/index.js benchmark",
+    "all": "node src/index.js all"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "neo4j-driver": "^5.28.1"
+  }
+}
