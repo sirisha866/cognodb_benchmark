@@ -1,0 +1,50 @@
+{
+  "database": "cognodb",
+  "dataset": "SNAP soc-Slashdot0811",
+  "settings": {
+    "database": "cognodb",
+    "iterations": 100,
+    "concurrency": 10,
+    "batchSize": 1000,
+    "traversalFanout": 50
+  },
+  "measuredAt": "2026-08-19T16:46:27.252Z",
+  "workloads": {
+    "oneHop": {
+      "iterations": 100,
+      "p50Ms": 250.96299999999974,
+      "p95Ms": 284.23019999999815
+    },
+    "twoHop": {
+      "iterations": 100,
+      "p50Ms": 251.03689999999915,
+      "p95Ms": 272.9683999999979
+    },
+    "threeHop": {
+      "iterations": 100,
+      "p50Ms": 264.6055999999953,
+      "p95Ms": 412.0751999999993
+    },
+    "pointLookup": {
+      "iterations": 100,
+      "p50Ms": 251.82589999999618,
+      "p95Ms": 286.88700000000244
+    },
+    "filteredLookup": {
+      "iterations": 100,
+      "p50Ms": 249.90600000001723,
+      "p95Ms": 273.6933999999892
+    },
+    "aggregation": {
+      "iterations": 100,
+      "p50Ms": 250.07759999998962,
+      "p95Ms": 284.0744999999879
+    },
+    "mixedWorkload": {
+      "concurrency": 10,
+      "completedQueries": 1000,
+      "queriesPerSecond": 34.04309892409477,
+      "readWriteMix": "80% reads / 20% writes"
+    }
+  }
+}
